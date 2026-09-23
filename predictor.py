@@ -1,19 +1,30 @@
 import numpy as np
 import pandas as pd
+import streamlit as st
 
 # ==============================================================================
-# PHASE 1: MACRO DATA INGESTION & ADJUSTED STRENGTH EXTRACTION
+# STREAMLIT PAGE CONFIGURATION
 # ==============================================================================
-def build_wsa_team_profiles(filepath_or_dataframe=None):
-    """
-    Ingests ODI match data and extracts team performance coefficients.
-    If no data file is present, returns the baseline Elo/WSA team strength matrix.
-    
-    WSA standard adjustment: Scales baseline ratings by calculating an 
-    opponent-adjusted scoring efficiency metric rather than a raw average.
-    """
-    # Baseline verified strength ratings ahead of the tournament cycle
-    base_ratings = {
+st.set_page_config(
+    page_title="2027 ODI WC Predictor | WSA Engine",
+    page_icon="🏏",
+    layout="wide"
+)
+
+# Custom Styling for Dark Dashboard Theme
+st.markdown("""
+    <style>
+    .main { background-color: #0f172a; }
+    h1 { color: #38bdf8; }
+    .stMetric { background-color: #1e293b; padding: 10px; border-radius: 10px; }
+    </style>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# PHASE 1: MACRO DATA & RATING SYSTEM
+# ==============================================================================
+def build_wsa_team_profiles():
+    return {
         "India": 122.5,
         "Australia": 120.0,
         "South Africa": 116.0,
@@ -29,176 +40,126 @@ def build_wsa_team_profiles(filepath_or_dataframe=None):
         "Scotland": 84.0,
         "Namibia": 80.0
     }
-    
-    if filepath_or_dataframe is None:
-        return base_ratings
-
-    try:
-        df = pd.read_csv(filepath_or_dataframe) if isinstance(filepath_or_dataframe, str) else filepath_or_dataframe
-        
-        # Calculate raw total runs per innings
-        df["total_runs"] = df["runs_off_bat"] + df["extras"]
-        
-        # Calculate mean runs per match per team
-        team_avg_runs = df.groupby("batting_team")["total_runs"].sum() / df.groupby("batting_team")["match_id"].nunique()
-        global_avg = team_avg_runs.mean()
-        
-        updated_ratings = {}
-        for team, base in base_ratings.items():
-            if team in team_avg_runs.index:
-                # Apply a square-root dampener to prevent outlier blowouts from distorting ratings
-                scaling_factor = np.sqrt(team_avg_runs[team] / global_avg)
-                updated_ratings[team] = base * scaling_factor
-            else:
-                updated_ratings[team] = base
-        return updated_ratings
-        
-    except Exception as e:
-        print(f"⚠️ Data compilation alert ({e}). Activating optimized WSA profile vectors...")
-        return base_ratings
 
 # ==============================================================================
-# PHASE 2: TOURNEY MATCH DETERMINISTIC PROBABILITY MATRIX
+# PHASE 2: SIMULATOR CLASS
 # ==============================================================================
-class WSATournamentSimulator:
-    """
-    An analytics-grade tournament simulation engine mapping 14 qualified teams 
-    through Groups, Super Sixes, and Knockouts using Monte Carlo iterations.
-    """
-    def __init__(self, team_ratings):
+class WSATournamentSimulator2027:
+    def __init__(self, team_ratings, seed=42):
         self.team_ratings = team_ratings
-        
-        # Official 14-Team ODI World Cup Format Group Designations
-        self.group_a = ["India", "England", "New Zealand", "Pakistan", "Sri Lanka", "Ireland", "Scotland"]
-        self.group_b = ["Australia", "South Africa", "Afghanistan", "Bangladesh", "Zimbabwe", "Netherlands", "Namibia"]
+        np.random.seed(seed)
+        sorted_teams = sorted(team_ratings.keys(), key=lambda t: team_ratings[t], reverse=True)
+        self.direct_qualifiers = sorted_teams[:11]
+        self.super_series_teams = sorted_teams[11:]
 
-    def simulate_match(self, team1, team2, conditions_factor=0.0):
-        """
-        Calculates win probability using a normalized Bradley-Terry/Elo distribution.
-        
-        CRITICAL FIX: Adjusted denominator from 32 to 400. A 32-point scale creates
-        near-infinite odds for minor rating gaps. A 400-point scale preserves standard 
-        sporting variance, giving underdogs a realistic mathematical path to upset wins.
-        """
-        r1 = self.team_ratings.get(team1, 90.0) + conditions_factor
+    def simulate_match(self, team1, team2):
+        r1 = self.team_ratings.get(team1, 90.0)
         r2 = self.team_ratings.get(team2, 90.0)
-        
-        # Logistic probability distribution formula
-        prob_team1 = 1 / (1 + 10 ** ((r2 - r1) / 400))
-        
+        prob_team1 = 1.0 / (1.0 + 10 ** ((r2 - r1) / 400.0))
         return team1 if np.random.random() < prob_team1 else team2
 
-    def run_group_stage(self, group_teams):
-        """Simulates a full round-robin stage within a group and returns sorted records."""
-        points = {team: 0 for team in group_teams}
-        nrc = {team: 0 for team in group_teams} # Net Run Coefficient proxy
-        
-        for i in range(len(group_teams)):
-            for j in range(i + 1, len(group_teams)):
-                t1, t2 = group_teams[i], group_teams[j]
+    def run_round_robin(self, teams):
+        points = {team: 0 for team in teams}
+        nrc = {team: 0.0 for team in teams}
+        for i in range(len(teams)):
+            for j in range(i + 1, len(teams)):
+                t1, t2 = teams[i], teams[j]
                 winner = self.simulate_match(t1, t2)
-                points[winner] += 2
-                
-                # Assign secondary tiebreaker differentials (variance tracking)
                 loser = t1 if winner == t2 else t2
+                points[winner] += 2
                 nrc[winner] += np.random.uniform(0.1, 1.5)
                 nrc[loser] -= np.random.uniform(0.1, 1.5)
-                
-        # Sort sequentially by Points, then by Net Run Coefficient
-        sorted_teams = sorted(group_teams, key=lambda x: (points[x], nrc[x]), reverse=True)
-        return sorted_teams[:3] # Top 3 teams advance to Super Six
+        return sorted(teams, key=lambda x: (points[x], nrc[x]), reverse=True), points, nrc
 
     def run_tournament_cycle(self):
-        """Simulates a complete tournament sequence: Groups -> Super Six -> Knockouts."""
-        # 1. Group Stage Execution
-        top_a = self.run_group_stage(self.group_a)
-        top_b = self.run_group_stage(self.group_b)
+        super_series_winner = self.run_round_robin(self.super_series_teams)[0][0]
+        round_2_teams = self.direct_qualifiers + [super_series_winner]
         
-        super_six_teams = top_a + top_b
+        group_a = round_2_teams[0::2]
+        group_b = round_2_teams[1::2]
         
-        # 2. Super Six Stage (Round Robin amongst qualifiers)
-        s6_points = {team: 0 for team in super_six_teams}
-        s6_nrc = {team: 0 for team in super_six_teams}
+        sorted_a, pts_a, nrc_a = self.run_round_robin(group_a)
+        sorted_b, pts_b, nrc_b = self.run_round_robin(group_b)
         
-        for i in range(len(super_six_teams)):
-            for j in range(i + 1, len(super_six_teams)):
-                t1, t2 = super_six_teams[i], super_six_teams[j]
-                winner = self.simulate_match(t1, t2)
-                s6_points[winner] += 2
-                loser = t1 if winner == t2 else t2
-                s6_nrc[winner] += np.random.uniform(0.1, 1.5)
-                s6_nrc[loser] -= np.random.uniform(0.1, 1.5)
-                
-        final_four = sorted(super_six_teams, key=lambda x: (s6_points[x], s6_nrc[x]), reverse=True)[:4]
+        top_a, top_b = sorted_a[:3], sorted_b[:3]
+        fourth_a, fourth_b = sorted_a[3], sorted_b[3]
+        best_fourth = fourth_a if (pts_a[fourth_a], nrc_a[fourth_a]) > (pts_b[fourth_b], nrc_b[fourth_b]) else fourth_b
         
-        # 3. Knockouts (Semi-Finals: 1st vs 4th, 2nd vs 3rd)
-        sf1_winner = self.simulate_match(final_four[0], final_four[3]) 
-        sf2_winner = self.simulate_match(final_four[1], final_four[2]) 
+        super_7_teams = top_a + top_b + [best_fourth]
+        sorted_s7, _, _ = self.run_round_robin(super_7_teams)
+        final_four = sorted_s7[:4]
         
-        # 4. Final Championship Match
+        sf1_winner = self.simulate_match(final_four[0], final_four[3])
+        sf2_winner = self.simulate_match(final_four[1], final_four[2])
         champion = self.simulate_match(sf1_winner, sf2_winner)
         
-        return {
-            "champion": champion,
-            "qualifiers": final_four
-        }
+        return {"champion": champion, "qualifiers": final_four}
 
     def execute_monte_carlo(self, iterations=10000):
-        """Runs the simulator over thousands of loops to extract convergence metrics."""
-        champion_distribution = {}
-        qualification_distribution = {}
+        champion_distribution = {team: 0 for team in self.team_ratings}
+        qualification_distribution = {team: 0 for team in self.team_ratings}
         
-        all_teams = self.group_a + self.group_b
-        for team in all_teams:
-            champion_distribution[team] = 0
-            qualification_distribution[team] = 0
-            
-        print(f"🎲 Initializing {iterations} Monte Carlo tournament iterations...")
         for _ in range(iterations):
             result = self.run_tournament_cycle()
-            
             champion_distribution[result["champion"]] += 1
             for qualified_team in result["qualifiers"]:
                 qualification_distribution[qualified_team] += 1
                 
-        # Transform structural raw values into percentage probabilities
         final_rankings = []
-        for team in all_teams:
+        for team in self.team_ratings:
             final_rankings.append({
                 "Team": team,
-                "Qualify Semis Chance": f"{(qualification_distribution[team] / iterations) * 100:.2f}%",
-                "Champion Win Chance": f"{(champion_distribution[team] / iterations) * 100:.2f}%",
+                "Base Rating": self.team_ratings[team],
+                "Semi-Final Chance (%)": round((qualification_distribution[team] / iterations) * 100, 2),
+                "Champion Win Chance (%)": round((champion_distribution[team] / iterations) * 100, 2),
                 "_raw_win": champion_distribution[team]
             })
             
-        df_rankings = pd.DataFrame(final_rankings).sort_values(by="_raw_win", ascending=False).drop(columns=["_raw_win"])
-        df_rankings.index = range(1, len(all_teams) + 1)
+        df_rankings = (
+            pd.DataFrame(final_rankings)
+            .sort_values(by="_raw_win", ascending=False)
+            .drop(columns=["_raw_win"])
+        )
+        df_rankings.index = range(1, len(self.team_ratings) + 1)
         return df_rankings
 
 # ==============================================================================
-# PHASE 3: EXECUTION RUNTIME
+# PHASE 3: INTERACTIVE DASHBOARD FRONTEND
 # ==============================================================================
-if __name__ == "__main__":
-    print("==================================================================")
-    print("      WSA ENGINE: MONTE CARLO PRODUCTION TOURNAMENT PREDICTOR     ")
-    print("==================================================================")
-    
-    DATA_TARGET = None 
-    
-    # Load rating vectors
-    ratings_matrix = build_wsa_team_profiles(DATA_TARGET)
-    
-    # Spin up engine runtime
-    engine = WSATournamentSimulator(ratings_matrix)
-    
-    # Run Monte Carlo loop with higher iterations for model stability
-    rankings_table = engine.execute_monte_carlo(iterations=10000)
-    
-    # Display Results
-    print("\n" + "="*66)
-    print("      FINAL PREDICTIVE RANKING LIST: CHAMPIONS & QUALIFIERS")
-    print("="*66)
-    print(rankings_table.to_string())
-    print("="*66)
-    print("Note: Output incorporates dynamic scaling factors and normalized\n"
-          "Bradley-Terry models tailored to sports performance analytics metrics.")
+st.title("🏏 2027 ODI World Cup Predictor")
+st.caption("Powered by Wolverine Sports Analytics (WSA) Monte Carlo Simulation Engine")
+
+# Sidebar Controls
+st.sidebar.header("⚙️ Simulation Controls")
+iterations = st.sidebar.slider("Monte Carlo Iterations", min_value=1000, max_value=50000, value=10000, step=1000)
+seed = st.sidebar.number_input("Random Seed (for Determinism)", value=42)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Tournament Rules")
+st.sidebar.text("• 14 Teams\n• Round 1: Super Series\n• Round 2: 2 Groups of 6\n• Round 3: Super 7 Stage\n• Final: Knockouts")
+
+# Execution Button
+if st.button("🚀 Run Live Monte Carlo Simulation", type="primary"):
+    with st.spinner(f"Running {iterations:,} Monte Carlo tournament loops..."):
+        ratings_matrix = build_wsa_team_profiles()
+        engine = WSATournamentSimulator2027(ratings_matrix, seed=seed)
+        df_results = engine.execute_monte_carlo(iterations=iterations)
+
+        # Highlight Top Winner Metrics
+        top_team = df_results.iloc[0]["Team"]
+        top_chance = df_results.iloc[0]["Champion Win Chance (%)"]
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Predicted Favorite", top_team)
+        col2.metric("Championship Win Probability", f"{top_chance}%")
+        col3.metric("Simulations Completed", f"{iterations:,}")
+
+        st.markdown("---")
+        st.subheader("Predictive Leaderboard")
+        
+        # Display Interactive Data Table
+        st.dataframe(
+            df_results.style.background_gradient(subset=["Champion Win Chance (%)"], cmap="Greens")
+                            .background_gradient(subset=["Semi-Final Chance (%)"], cmap="Blues"),
+            use_container_width=True
+        )
